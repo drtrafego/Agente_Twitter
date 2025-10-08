@@ -304,24 +304,45 @@ def bot_status():
     
     return jsonify(status)
 
-def main():
-    """Função principal"""
+# Inicializar bot automaticamente quando o módulo for importado
+def init_bot():
+    """Inicializar bot para Gunicorn"""
     global bot
     
     try:
-        # Inicializar bot
-        bot = XAPIBot()
+        if bot is None:
+            # Inicializar bot
+            bot = XAPIBot()
+            
+            # Verificar autenticação
+            if not bot.authenticate():
+                logging.error("Falha na autenticacao")
+                return False
+            
+            # Iniciar bot em thread separada
+            bot_thread = Thread(target=bot.run_bot_loop, daemon=True)
+            bot_thread.start()
+            
+            logging.info("Bot inicializado com sucesso para Gunicorn")
+            return True
+            
+    except Exception as e:
+        logging.error(f"Erro na inicializacao do bot: {e}")
+        return False
+
+# Inicializar bot quando o módulo for carregado
+init_bot()
+
+def main():
+    """Função principal para execução local"""
+    global bot
+    
+    try:
+        # Para execução local (desenvolvimento)
+        if bot is None:
+            init_bot()
         
-        # Verificar autenticação
-        if not bot.authenticate():
-            logging.error("Falha na autenticacao - Encerrando")
-            return
-        
-        # Iniciar bot em thread separada
-        bot_thread = Thread(target=bot.run_bot_loop, daemon=True)
-        bot_thread.start()
-        
-        # Iniciar Flask app
+        # Iniciar Flask app localmente
         port = int(os.environ.get('PORT', 5000))
         logging.info(f"Iniciando servidor Flask na porta {port}")
         app.run(host='0.0.0.0', port=port, debug=False)

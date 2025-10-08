@@ -1,1 +1,1 @@
-web: python bot_railway_optimized.py
+web: waitress-serve --host=0.0.0.0 --port=$PORT bot_railway_optimized:app

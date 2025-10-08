@@ -14,7 +14,6 @@ API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
-BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME")
 
 # URL de conexão do banco de dados Neon
@@ -68,6 +67,7 @@ def response_worker():
                     
                     if respostas:
                         resposta = random.choice(respostas)
+                        # Usando API v2 com OAuth 1.0a para responder
                         client_v2.create_tweet(in_reply_to_tweet_id=tweet_id, text=resposta)
                         print(f"Tweet {tweet_id} respondido com: '{resposta}'")
 
@@ -91,40 +91,82 @@ def response_worker():
         # Espera antes de verificar a fila novamente
         time.sleep(10)
 
-class MentionStream(tweepy.StreamingClient):
-    def on_tweet(self, tweet):
-        print(f"Menção recebida de @{tweet.author_id}: {tweet.text}")
-        
-        # Calcula o tempo para processamento (delay de 2 a 4 minutos)
-        delay = random.randint(120, 240)
-        process_after = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(time.time() + delay))
-
-        conn = None
+def check_mentions():
+    """Verifica menções periodicamente usando a API v2."""
+    print("Verificador de menções iniciado.")
+    last_id = None
+    
+    while True:
         try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO tweet_queue (tweet_id, author_id, process_after) VALUES (%s, %s, %s);",
-                (tweet.id, tweet.author_id, process_after)
+            # Busca menções usando API v2
+            query = f"@{BOT_USERNAME}"
+            if last_id:
+                query += f" since_id:{last_id}"
+            
+            tweets = client_v2.search_recent_tweets(
+                query=query,
+                max_results=10,
+                tweet_fields=['author_id', 'created_at', 'in_reply_to_user_id']
             )
-            conn.commit()
-            cur.close()
-            print(f"Tweet {tweet.id} adicionado à fila para processar em {delay} segundos.")
-        except psycopg2.Error as e:
-            print(f"Erro ao inserir tweet na fila: {e}")
-        finally:
-            if conn:
-                conn.close()
+            
+            if tweets.data:
+                for tweet in reversed(tweets.data):  # Processa do mais antigo para o mais novo
+                    # Verifica se não é o próprio bot
+                    user_info = client_v2.get_user(id=tweet.author_id)
+                    if user_info.data.username.lower() != BOT_USERNAME.lower():
+                        print(f"Menção recebida de @{user_info.data.username}: {tweet.text}")
+                        
+                        # Calcula o tempo para processamento (delay de 2 a 4 minutos)
+                        delay = random.randint(120, 240)
+                        process_after = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(time.time() + delay))
 
-    def on_connection_error(self):
-        print("Erro de conexão com a stream. Tentando reconectar...")
-        time.sleep(15)
+                        conn = None
+                        try:
+                            conn = get_db_connection()
+                            cur = conn.cursor()
+                            
+                            # Verifica se o tweet já foi processado
+                            cur.execute("SELECT id FROM tweet_queue WHERE tweet_id = %s;", (tweet.id,))
+                            if not cur.fetchone():
+                                cur.execute(
+                                    "INSERT INTO tweet_queue (tweet_id, author_id, process_after) VALUES (%s, %s, %s);",
+                                    (tweet.id, tweet.author_id, process_after)
+                                )
+                                conn.commit()
+                                print(f"Tweet {tweet.id} adicionado à fila para processar em {delay} segundos.")
+                            
+                            cur.close()
+                        except psycopg2.Error as e:
+                            print(f"Erro ao inserir tweet na fila: {e}")
+                        finally:
+                            if conn:
+                                conn.close()
+                    
+                    last_id = tweet.id
+                
+                print(f"Processadas {len(tweets.data)} menções. Última ID: {last_id}")
+            else:
+                print("Nenhuma menção nova encontrada.")
+            
+        except tweepy.errors.TweepyException as e:
+            print(f"Erro ao buscar menções: {e}")
+            if "rate limit" in str(e).lower():
+                print("Rate limit atingido. Aguardando 15 minutos...")
+                time.sleep(900)  # 15 minutos
+            else:
+                time.sleep(60)  # 1 minuto para outros erros
+        except Exception as e:
+            print(f"Erro inesperado: {e}")
+            time.sleep(60)
+        
+        # Espera 60 segundos antes da próxima verificação
+        time.sleep(60)
 
 if __name__ == "__main__":
     # Garante que a tabela do banco de dados exista
     setup_database()
 
-    # Autenticação com a API v2 para responder
+    # Autenticação OAuth 1.0a com API v2 (que está funcionando!)
     client_v2 = tweepy.Client(
         consumer_key=API_KEY,
         consumer_secret=API_KEY_SECRET,
@@ -132,23 +174,33 @@ if __name__ == "__main__":
         access_token_secret=ACCESS_TOKEN_SECRET
     )
 
+    # Verifica se a autenticação está funcionando
+    try:
+        user = client_v2.get_me()
+        print(f"✅ Autenticação bem-sucedida! Logado como: @{user.data.username}")
+    except Exception as e:
+        print(f"❌ Erro na autenticação: {e}")
+        exit(1)
+
     # Inicia o worker de resposta em uma thread separada
     worker_thread = threading.Thread(target=response_worker, daemon=True)
     worker_thread.start()
 
-    # Inicia a escuta de menções
-    stream = MentionStream(BEARER_TOKEN)
+    # Inicia o verificador de menções em uma thread separada
+    mention_thread = threading.Thread(target=check_mentions, daemon=True)
+    mention_thread.start()
     
-    # Limpa regras antigas
-    rules = stream.get_rules().data
-    if rules:
-        stream.delete_rules([rule.id for rule in rules])
-        print("Regras de stream antigas foram limpas.")
-
-    # Adiciona nova regra para ouvir menções
-    rule = f"to:{BOT_USERNAME}"
-    stream.add_rules(tweepy.StreamRule(rule))
-    print(f"Regra de stream adicionada: '{rule}'")
-
-    print("Iniciando a escuta por menções...")
-    stream.filter(threaded=True)
+    print("🤖 Bot iniciado com sucesso!")
+    print("📝 Worker de resposta: ativo")
+    print("👂 Verificador de menções: ativo")
+    print("⏰ Verificando menções a cada 60 segundos")
+    print("🔄 Processando respostas a cada 10 segundos")
+    print("🔑 Usando OAuth 1.0a com API v2")
+    
+    # Mantém o programa rodando
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Parando o bot...")
+        exit(0)
