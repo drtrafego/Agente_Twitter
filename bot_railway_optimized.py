@@ -38,6 +38,11 @@ class XAPIBot:
         self.bearer_token = os.getenv('BEARER_TOKEN')
         self.bot_username = os.getenv('BOT_USERNAME', 'drtrafeg0')
         
+        # Verificar se todas as credenciais estão presentes
+        if not all([self.api_key, self.api_key_secret, self.access_token, 
+                   self.access_token_secret, self.bearer_token]):
+            raise ValueError("Credenciais incompletas! Verifique as variáveis de ambiente.")
+        
         # Configurações
         self.base_url = "https://api.x.com/2"
         self.daily_limit = 17  # Free Tier limit
