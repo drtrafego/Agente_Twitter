@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot X API v2 Otimizado para Railway
-Versão com healthcheck endpoint e timeout handling
+Bot X API v2 - Versão Railway Definitiva
+Otimizado para deploy em produção no Railway
 """
 
 import os
@@ -18,19 +18,28 @@ from dotenv import load_dotenv
 # Carregar variáveis de ambiente
 load_dotenv()
 
-# Configurar logging sem emojis para compatibilidade
+# Configurar logging APENAS para console (sem arquivo)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bot_railway.log', encoding='utf-8')
-    ]
+    handlers=[logging.StreamHandler()]
 )
+
+# Inicializar Flask app
+app = Flask(__name__)
+
+# Variáveis globais
+bot = None
+bot_status = {
+    'running': False,
+    'daily_posts': 0,
+    'last_activity': None,
+    'error': None
+}
 
 class XAPIBot:
     def __init__(self):
-        # Credenciais
+        # Credenciais obrigatórias
         self.api_key = os.getenv('API_KEY')
         self.api_key_secret = os.getenv('API_KEY_SECRET')
         self.access_token = os.getenv('ACCESS_TOKEN')
@@ -38,34 +47,37 @@ class XAPIBot:
         self.bearer_token = os.getenv('BEARER_TOKEN')
         self.bot_username = os.getenv('BOT_USERNAME', 'drtrafeg0')
         
-        # Verificar se todas as credenciais estão presentes
-        if not all([self.api_key, self.api_key_secret, self.access_token, 
-                   self.access_token_secret, self.bearer_token]):
-            raise ValueError("Credenciais incompletas! Verifique as variáveis de ambiente.")
+        # Validação crítica
+        missing_vars = []
+        if not self.api_key: missing_vars.append('API_KEY')
+        if not self.api_key_secret: missing_vars.append('API_KEY_SECRET')
+        if not self.access_token: missing_vars.append('ACCESS_TOKEN')
+        if not self.access_token_secret: missing_vars.append('ACCESS_TOKEN_SECRET')
+        if not self.bearer_token: missing_vars.append('BEARER_TOKEN')
+        
+        if missing_vars:
+            error_msg = f"Variáveis faltando: {', '.join(missing_vars)}"
+            logging.error(error_msg)
+            raise ValueError(error_msg)
         
         # Configurações
         self.base_url = "https://api.x.com/2"
-        self.daily_limit = 17  # Free Tier limit
+        self.daily_limit = 17
         self.daily_posts = 0
         self.last_reset = datetime.now().date()
-        
-        # Cache para evitar duplicatas
-        self.processed_mentions = set()
-        
-        # Status do bot
-        self.is_running = True
+        self.is_running = False
         self.last_activity = datetime.now()
         
-        logging.info(f"Bot X API v2 inicializado para @{self.bot_username}")
-        logging.info(f"Limite diario: {self.daily_limit} posts")
+        logging.info(f"Bot inicializado para @{self.bot_username}")
 
-    def get_oauth1_headers(self, method, url, params=None):
-        """Gerar headers OAuth 1.0a para User Context"""
+    def generate_oauth_header(self, method, url, params=None):
+        """Gera header OAuth 1.0a"""
+        import urllib.parse
         import hmac
         import hashlib
         import base64
-        import urllib.parse
-        from secrets import token_urlsafe
+        import secrets
+        import string
         
         # Parâmetros OAuth
         oauth_params = {
@@ -73,12 +85,12 @@ class XAPIBot:
             'oauth_token': self.access_token,
             'oauth_signature_method': 'HMAC-SHA1',
             'oauth_timestamp': str(int(time.time())),
-            'oauth_nonce': token_urlsafe(32),
+            'oauth_nonce': ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32)),
             'oauth_version': '1.0'
         }
         
         # Combinar parâmetros
-        all_params = {**oauth_params}
+        all_params = oauth_params.copy()
         if params:
             all_params.update(params)
         
@@ -86,10 +98,10 @@ class XAPIBot:
         param_string = '&'.join([f"{k}={urllib.parse.quote(str(v), safe='')}" 
                                 for k, v in sorted(all_params.items())])
         
-        # Criar base string
+        # Base string
         base_string = f"{method}&{urllib.parse.quote(url, safe='')}&{urllib.parse.quote(param_string, safe='')}"
         
-        # Criar chave de assinatura
+        # Chave de assinatura
         signing_key = f"{urllib.parse.quote(self.api_key_secret, safe='')}&{urllib.parse.quote(self.access_token_secret, safe='')}"
         
         # Gerar assinatura
@@ -99,260 +111,208 @@ class XAPIBot:
         
         oauth_params['oauth_signature'] = signature
         
-        # Criar header Authorization
+        # Header Authorization
         auth_header = 'OAuth ' + ', '.join([f'{k}="{urllib.parse.quote(str(v), safe="")}"' 
                                            for k, v in sorted(oauth_params.items())])
         
-        return {'Authorization': auth_header, 'Content-Type': 'application/json'}
+        return auth_header
 
     def authenticate(self):
-        """Verificar autenticação"""
+        """Autentica com a API do X"""
         try:
             url = f"{self.base_url}/users/me"
-            headers = self.get_oauth1_headers('GET', url)
-            
-            response = requests.get(url, headers=headers, timeout=30)
-            logging.info(f"GET users/me - Status: {response.status_code}")
-            
-            if response.status_code == 200:
-                user_data = response.json()
-                username = user_data.get('data', {}).get('username', 'unknown')
-                logging.info(f"Autenticado como @{username}")
-                return True
-            else:
-                logging.error(f"Erro de autenticacao: {response.status_code} - {response.text}")
-                return False
-                
-        except Exception as e:
-            logging.error(f"Erro na autenticacao: {e}")
-            return False
-
-    def search_mentions(self):
-        """Buscar menções usando Bearer Token"""
-        try:
-            # Reset contador diário se necessário
-            if datetime.now().date() > self.last_reset:
-                self.daily_posts = 0
-                self.last_reset = datetime.now().date()
-                logging.info("Contador diario resetado")
-            
-            # Verificar limite diário
-            if self.daily_posts >= self.daily_limit:
-                logging.warning(f"Limite diario atingido: {self.daily_posts}/{self.daily_limit}")
-                return []
-            
-            # Buscar menções
-            query = f"@{self.bot_username} -is:retweet"
-            url = f"{self.base_url}/tweets/search/recent"
             headers = {
-                'Authorization': f'Bearer {self.bearer_token}',
+                'Authorization': self.generate_oauth_header('GET', url),
                 'Content-Type': 'application/json'
             }
-            params = {
-                'query': query,
-                'max_results': 10,
-                'tweet.fields': 'author_id,created_at,text'
-            }
             
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-            logging.info(f"GET tweets/search/recent - Status: {response.status_code}")
+            response = requests.get(url, headers=headers, timeout=30)
+            logging.info(f"Auth status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
-                mentions = data.get('data', [])
-                new_mentions = [m for m in mentions if m['id'] not in self.processed_mentions]
+                username = data.get('data', {}).get('username', 'unknown')
+                logging.info(f"Autenticado como @{username}")
+                return True
+            else:
+                logging.error(f"Erro auth: {response.status_code} - {response.text}")
+                return False
                 
-                logging.info(f"Encontradas {len(new_mentions)} novas mencoes")
-                return new_mentions
-                
+        except Exception as e:
+            logging.error(f"Erro na autenticação: {e}")
+            return False
+
+    def search_mentions(self):
+        """Busca menções recentes"""
+        try:
+            query = f"@{self.bot_username} -is:retweet"
+            url = f"{self.base_url}/tweets/search/recent"
+            params = {
+                'query': query,
+                'max_results': 10,
+                'tweet.fields': 'created_at,author_id,conversation_id'
+            }
+            
+            headers = {
+                'Authorization': f"Bearer {self.bearer_token}",
+                'Content-Type': 'application/json'
+            }
+            
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            logging.info(f"Search status: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                tweets = data.get('data', [])
+                logging.info(f"Encontradas {len(tweets)} menções")
+                return tweets
             elif response.status_code == 429:
-                logging.warning("Rate limit atingido - Aguardando...")
-                time.sleep(900)  # 15 minutos
+                logging.warning("Rate limit - aguardando...")
                 return []
             else:
-                logging.error(f"Erro ao buscar mencoes: {response.status_code} - {response.text}")
+                logging.error(f"Erro search: {response.status_code}")
                 return []
                 
         except Exception as e:
-            logging.error(f"Erro na busca de mencoes: {e}")
+            logging.error(f"Erro na busca: {e}")
             return []
 
-    def generate_response(self, mention_text):
-        """Gerar resposta baseada no texto da menção"""
-        text = mention_text.lower()
-        
-        if any(word in text for word in ['oi', 'hello', 'ola']):
-            return "Oi! Como posso ajudar voce hoje?"
-        elif any(word in text for word in ['ajuda', 'help']):
-            return "Estou aqui para ajudar! Me mencione com suas duvidas."
-        elif 'bot' in text:
-            return "Sim, sou um bot automatizado! Como posso ser util?"
-        elif any(word in text for word in ['obrigado', 'thanks', 'valeu']):
-            return "De nada! Fico feliz em ajudar!"
-        else:
-            return "Obrigado por me mencionar! Como posso ajudar?"
-
-    def create_tweet(self, text):
-        """Criar tweet usando OAuth 1.0a"""
+    def create_tweet(self, text, reply_to=None):
+        """Cria um tweet"""
         try:
-            if self.daily_posts >= self.daily_limit:
-                logging.warning(f"Limite diario atingido: {self.daily_posts}/{self.daily_limit}")
-                return False
-            
             url = f"{self.base_url}/tweets"
-            headers = self.get_oauth1_headers('POST', url)
-            data = json.dumps({'text': text})
             
-            response = requests.post(url, headers=headers, data=data, timeout=30)
-            logging.info(f"POST tweets - Status: {response.status_code}")
+            payload = {'text': text}
+            if reply_to:
+                payload['reply'] = {'in_reply_to_tweet_id': reply_to}
+            
+            headers = {
+                'Authorization': self.generate_oauth_header('POST', url),
+                'Content-Type': 'application/json'
+            }
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            logging.info(f"Tweet status: {response.status_code}")
             
             if response.status_code == 201:
                 self.daily_posts += 1
+                self.last_activity = datetime.now()
                 logging.info(f"Tweet criado! Posts hoje: {self.daily_posts}/{self.daily_limit}")
                 return True
             else:
-                logging.error(f"Erro ao criar tweet: {response.status_code} - {response.text}")
+                logging.error(f"Erro tweet: {response.status_code} - {response.text}")
                 return False
                 
         except Exception as e:
-            logging.error(f"Erro na criacao de tweet: {e}")
+            logging.error(f"Erro ao criar tweet: {e}")
             return False
 
     def process_mentions(self):
-        """Processar menções e responder"""
-        try:
-            mentions = self.search_mentions()
+        """Processa menções e responde"""
+        mentions = self.search_mentions()
+        
+        for mention in mentions:
+            if self.daily_posts >= self.daily_limit:
+                logging.info("Limite diário atingido")
+                break
+                
+            tweet_id = mention.get('id')
+            text = mention.get('text', '')
             
-            for mention in mentions:
-                if mention['id'] in self.processed_mentions:
-                    continue
-                
-                # Marcar como processada
-                self.processed_mentions.add(mention['id'])
-                
-                # Gerar resposta
-                response_text = self.generate_response(mention['text'])
-                
-                # Criar tweet de resposta
-                if self.create_tweet(response_text):
-                    logging.info(f"Respondeu a mencao: {mention['id']}")
-                    self.last_activity = datetime.now()
-                    time.sleep(2)  # Evitar rate limit
-                else:
-                    break  # Parar se não conseguir criar tweet
-                    
-        except Exception as e:
-            logging.error(f"Erro ao processar mencoes: {e}")
+            # Resposta simples
+            response_text = "Olá! Obrigado por me mencionar. Como posso ajudar?"
+            
+            if self.create_tweet(response_text, reply_to=tweet_id):
+                logging.info(f"Respondeu à menção: {tweet_id}")
+                time.sleep(2)  # Evitar rate limit
 
     def run_bot_loop(self):
         """Loop principal do bot"""
-        logging.info("Iniciando loop do bot...")
+        self.is_running = True
         
         while self.is_running:
             try:
+                # Reset diário
+                today = datetime.now().date()
+                if today > self.last_reset:
+                    self.daily_posts = 0
+                    self.last_reset = today
+                    logging.info("Contador diário resetado")
+                
                 # Processar menções
-                self.process_mentions()
+                if self.daily_posts < self.daily_limit:
+                    self.process_mentions()
                 
-                # Heartbeat
-                logging.info(f"Bot ativo - Posts hoje: {self.daily_posts}/{self.daily_limit}")
-                self.last_activity = datetime.now()
+                # Atualizar status
+                global bot_status
+                bot_status.update({
+                    'running': True,
+                    'daily_posts': self.daily_posts,
+                    'last_activity': self.last_activity.isoformat(),
+                    'error': None
+                })
                 
-                # Aguardar antes da próxima verificação
+                # Aguardar próximo ciclo
                 time.sleep(300)  # 5 minutos
                 
             except Exception as e:
-                logging.error(f"Erro no loop principal: {e}")
+                logging.error(f"Erro no loop: {e}")
+                bot_status['error'] = str(e)
                 time.sleep(60)  # Aguardar 1 minuto em caso de erro
 
-# Flask app para healthcheck
-app = Flask(__name__)
-bot = None
-
-@app.route('/')
-def health_check():
-    """Endpoint de healthcheck para Railway"""
-    global bot
+# Endpoints Flask
+@app.route('/', methods=['GET'])
+def healthcheck():
+    """Endpoint de healthcheck"""
+    global bot_status
     
-    status = {
+    return jsonify({
         'status': 'healthy',
+        'bot_running': bot_status['running'],
+        'daily_limit': 17,
+        'daily_posts': bot_status['daily_posts'],
+        'last_activity': bot_status['last_activity'],
         'timestamp': datetime.now().isoformat(),
-        'bot_running': bot.is_running if bot else False,
-        'daily_posts': bot.daily_posts if bot else 0,
-        'daily_limit': bot.daily_limit if bot else 17,
-        'last_activity': bot.last_activity.isoformat() if bot and bot.last_activity else None
-    }
-    
-    return jsonify(status)
+        'error': bot_status['error']
+    })
 
-@app.route('/status')
-def bot_status():
-    """Status detalhado do bot"""
-    global bot
-    
-    if not bot:
-        return jsonify({'error': 'Bot not initialized'}), 500
-    
-    status = {
-        'bot_username': bot.bot_username,
-        'is_running': bot.is_running,
-        'daily_posts': bot.daily_posts,
-        'daily_limit': bot.daily_limit,
-        'last_reset': bot.last_reset.isoformat(),
-        'last_activity': bot.last_activity.isoformat() if bot.last_activity else None,
-        'processed_mentions_count': len(bot.processed_mentions)
-    }
-    
-    return jsonify(status)
+@app.route('/status', methods=['GET'])
+def status():
+    """Status detalhado"""
+    return healthcheck()
 
-# Inicializar bot automaticamente quando o módulo for importado
 def init_bot():
-    """Inicializar bot para Gunicorn"""
-    global bot
+    """Inicializa o bot para Railway"""
+    global bot, bot_status
     
     try:
-        if bot is None:
-            # Inicializar bot
-            bot = XAPIBot()
-            
-            # Verificar autenticação
-            if not bot.authenticate():
-                logging.error("Falha na autenticacao")
-                return False
-            
-            # Iniciar bot em thread separada
-            bot_thread = Thread(target=bot.run_bot_loop, daemon=True)
-            bot_thread.start()
-            
-            logging.info("Bot inicializado com sucesso para Gunicorn")
-            return True
-            
+        logging.info("Iniciando bot para Railway...")
+        
+        # Criar instância do bot
+        bot = XAPIBot()
+        
+        # Autenticar
+        if not bot.authenticate():
+            raise Exception("Falha na autenticação")
+        
+        # Iniciar em thread separada
+        bot_thread = Thread(target=bot.run_bot_loop, daemon=True)
+        bot_thread.start()
+        
+        bot_status['running'] = True
+        logging.info("Bot inicializado com sucesso!")
+        
     except Exception as e:
-        logging.error(f"Erro na inicializacao do bot: {e}")
-        return False
+        error_msg = f"Erro na inicialização: {e}"
+        logging.error(error_msg)
+        bot_status['error'] = error_msg
+        bot_status['running'] = False
 
-# Inicializar bot quando o módulo for carregado
+# Inicializar bot automaticamente
 init_bot()
 
-def main():
-    """Função principal para execução local"""
-    global bot
-    
-    try:
-        # Para execução local (desenvolvimento)
-        if bot is None:
-            init_bot()
-        
-        # Iniciar Flask app localmente
-        port = int(os.environ.get('PORT', 5000))
-        logging.info(f"Iniciando servidor Flask na porta {port}")
-        app.run(host='0.0.0.0', port=port, debug=False)
-        
-    except Exception as e:
-        logging.error(f"Erro na funcao principal: {e}")
-    finally:
-        if bot:
-            bot.is_running = False
-        logging.info("Bot encerrado")
-
+# Para execução local
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get('PORT', 5000))
+    logging.info(f"Iniciando servidor na porta {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
