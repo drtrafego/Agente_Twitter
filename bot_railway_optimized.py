@@ -3,6 +3,7 @@
 """
 Bot X API v2 - Versão Railway Definitiva
 Otimizado para deploy em produção no Railway
+Agora com monitoramento de comentários nos posts próprios
 """
 
 import os
@@ -10,6 +11,7 @@ import time
 import json
 import logging
 import requests
+import random
 from datetime import datetime, timedelta
 from threading import Thread
 from flask import Flask, jsonify
@@ -34,7 +36,9 @@ bot_status = {
     'running': False,
     'daily_posts': 0,
     'last_activity': None,
-    'error': None
+    'error': None,
+    'monitored_posts': 0,
+    'replies_found': 0
 }
 
 class XAPIBot:
@@ -67,6 +71,12 @@ class XAPIBot:
         self.last_reset = datetime.now().date()
         self.is_running = False
         self.last_activity = datetime.now()
+        
+        # Novos atributos para monitoramento de comentários
+        self.my_user_id = None
+        self.monitored_posts = []
+        self.replied_comments = set()  # IDs dos comentários já respondidos
+        self.last_comment_check = datetime.now()
         
         logging.info(f"Bot inicializado para @{self.bot_username}")
 
@@ -118,7 +128,7 @@ class XAPIBot:
         return auth_header
 
     def authenticate(self):
-        """Autentica com a API do X"""
+        """Autentica com a API do X e obtém user_id"""
         try:
             url = f"{self.base_url}/users/me"
             headers = {
@@ -131,8 +141,10 @@ class XAPIBot:
             
             if response.status_code == 200:
                 data = response.json()
-                username = data.get('data', {}).get('username', 'unknown')
-                logging.info(f"Autenticado como @{username}")
+                user_data = data.get('data', {})
+                username = user_data.get('username', 'unknown')
+                self.my_user_id = user_data.get('id')
+                logging.info(f"Autenticado como @{username} (ID: {self.my_user_id})")
                 return True
             else:
                 logging.error(f"Erro auth: {response.status_code} - {response.text}")
@@ -141,6 +153,93 @@ class XAPIBot:
         except Exception as e:
             logging.error(f"Erro na autenticação: {e}")
             return False
+
+    def get_my_recent_posts(self):
+        """Busca posts próprios dos últimos 7 dias"""
+        try:
+            if not self.my_user_id:
+                logging.error("User ID não disponível")
+                return []
+            
+            # Data de 7 dias atrás
+            seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
+            
+            url = f"{self.base_url}/users/{self.my_user_id}/tweets"
+            params = {
+                'max_results': 10,
+                'tweet.fields': 'created_at,conversation_id,public_metrics',
+                'start_time': seven_days_ago
+            }
+            
+            headers = {
+                'Authorization': f"Bearer {self.bearer_token}",
+                'Content-Type': 'application/json'
+            }
+            
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            logging.info(f"Posts próprios status: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                posts = data.get('data', [])
+                logging.info(f"Encontrados {len(posts)} posts próprios dos últimos 7 dias")
+                return posts
+            else:
+                logging.error(f"Erro ao buscar posts próprios: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            logging.error(f"Erro ao buscar posts próprios: {e}")
+            return []
+
+    def search_replies_to_post(self, post_id):
+        """Busca replies/comentários para um post específico"""
+        try:
+            query = f"conversation_id:{post_id} -from:{self.bot_username}"
+            url = f"{self.base_url}/tweets/search/recent"
+            params = {
+                'query': query,
+                'max_results': 10,
+                'tweet.fields': 'created_at,author_id,conversation_id,in_reply_to_user_id'
+            }
+            
+            headers = {
+                'Authorization': f"Bearer {self.bearer_token}",
+                'Content-Type': 'application/json'
+            }
+            
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                replies = data.get('data', [])
+                # Filtrar apenas replies que não são nossos e que não respondemos ainda
+                new_replies = [
+                    reply for reply in replies 
+                    if reply.get('author_id') != self.my_user_id 
+                    and reply.get('id') not in self.replied_comments
+                ]
+                return new_replies
+            elif response.status_code == 429:
+                logging.warning("Rate limit na busca de replies")
+                return []
+            else:
+                logging.error(f"Erro ao buscar replies: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            logging.error(f"Erro ao buscar replies: {e}")
+            return []
+
+    def load_responses(self):
+        """Carrega respostas do arquivo respostas.txt"""
+        try:
+            with open('respostas.txt', 'r', encoding='utf-8') as f:
+                responses = [line.strip() for line in f if line.strip()]
+            return responses if responses else ["Obrigado pelo seu comentário!"]
+        except Exception as e:
+            logging.error(f"Erro ao carregar respostas: {e}")
+            return ["Obrigado pelo seu comentário!"]
 
     def search_mentions(self):
         """Busca menções recentes"""
@@ -210,6 +309,7 @@ class XAPIBot:
     def process_mentions(self):
         """Processa menções e responde"""
         mentions = self.search_mentions()
+        responses = self.load_responses()
         
         for mention in mentions:
             if self.daily_posts >= self.daily_limit:
@@ -217,14 +317,61 @@ class XAPIBot:
                 break
                 
             tweet_id = mention.get('id')
-            text = mention.get('text', '')
             
-            # Resposta simples
-            response_text = "Olá! Obrigado por me mencionar. Como posso ajudar?"
+            # Escolher resposta aleatória
+            response_text = random.choice(responses)
             
             if self.create_tweet(response_text, reply_to=tweet_id):
                 logging.info(f"Respondeu à menção: {tweet_id}")
-                time.sleep(2)  # Evitar rate limit
+                # Intervalo aleatório entre 2-4 minutos para evitar detecção
+                wait_time = random.randint(120, 240)
+                logging.info(f"Aguardando {wait_time//60}min {wait_time%60}s antes da próxima ação")
+                time.sleep(wait_time)
+
+    def process_post_comments(self):
+        """Processa comentários nos posts próprios"""
+        if self.daily_posts >= self.daily_limit:
+            return
+        
+        # Atualizar lista de posts próprios a cada hora
+        if (datetime.now() - self.last_comment_check).seconds > 3600:
+            self.monitored_posts = self.get_my_recent_posts()
+            self.last_comment_check = datetime.now()
+            
+            global bot_status
+            bot_status['monitored_posts'] = len(self.monitored_posts)
+        
+        responses = self.load_responses()
+        replies_found = 0
+        
+        for post in self.monitored_posts:
+            if self.daily_posts >= self.daily_limit:
+                break
+                
+            post_id = post.get('id')
+            replies = self.search_replies_to_post(post_id)
+            replies_found += len(replies)
+            
+            for reply in replies:
+                if self.daily_posts >= self.daily_limit:
+                    break
+                    
+                reply_id = reply.get('id')
+                
+                # Escolher resposta aleatória
+                response_text = random.choice(responses)
+                
+                if self.create_tweet(response_text, reply_to=reply_id):
+                    logging.info(f"Respondeu ao comentário: {reply_id}")
+                    self.replied_comments.add(reply_id)
+                    
+                    # Intervalo aleatório entre 2-4 minutos para evitar detecção
+                    wait_time = random.randint(120, 240)
+                    logging.info(f"Aguardando {wait_time//60}min {wait_time%60}s antes da próxima ação")
+                    time.sleep(wait_time)
+        
+        global bot_status
+        bot_status['replies_found'] = replies_found
 
     def run_bot_loop(self):
         """Loop principal do bot"""
@@ -237,11 +384,16 @@ class XAPIBot:
                 if today > self.last_reset:
                     self.daily_posts = 0
                     self.last_reset = today
+                    self.replied_comments.clear()  # Limpar comentários respondidos
                     logging.info("Contador diário resetado")
                 
-                # Processar menções
                 if self.daily_posts < self.daily_limit:
+                    # Processar menções (prioridade)
                     self.process_mentions()
+                    
+                    # Processar comentários nos posts próprios
+                    if self.daily_posts < self.daily_limit:
+                        self.process_post_comments()
                 
                 # Atualizar status
                 global bot_status
@@ -252,8 +404,8 @@ class XAPIBot:
                     'error': None
                 })
                 
-                # Aguardar próximo ciclo
-                time.sleep(300)  # 5 minutos
+                # Aguardar próximo ciclo (5 minutos)
+                time.sleep(300)
                 
             except Exception as e:
                 logging.error(f"Erro no loop: {e}")
@@ -272,6 +424,8 @@ def healthcheck():
         'daily_limit': 17,
         'daily_posts': bot_status['daily_posts'],
         'last_activity': bot_status['last_activity'],
+        'monitored_posts': bot_status['monitored_posts'],
+        'replies_found': bot_status['replies_found'],
         'timestamp': datetime.now().isoformat(),
         'error': bot_status['error']
     })
