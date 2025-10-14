@@ -51,6 +51,10 @@ class XAPIBot:
         self.bearer_token = os.getenv('BEARER_TOKEN')
         self.bot_username = os.getenv('BOT_USERNAME', 'drtrafeg0')
         
+        # Garantir que username não tenha @ no início
+        if self.bot_username.startswith('@'):
+            self.bot_username = self.bot_username[1:]
+        
         # Validação crítica
         missing_vars = []
         if not self.api_key: missing_vars.append('API_KEY')
