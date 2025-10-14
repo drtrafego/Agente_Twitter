@@ -330,6 +330,7 @@ class XAPIBot:
 
     def process_post_comments(self):
         """Processa comentários nos posts próprios"""
+        global bot_status
         if self.daily_posts >= self.daily_limit:
             return
         
@@ -370,7 +371,6 @@ class XAPIBot:
                     logging.info(f"Aguardando {wait_time//60}min {wait_time%60}s antes da próxima ação")
                     time.sleep(wait_time)
         
-        global bot_status
         bot_status['replies_found'] = replies_found
 
     def run_bot_loop(self):
