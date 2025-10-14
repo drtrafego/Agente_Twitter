@@ -244,12 +244,14 @@ class XAPIBot:
     def search_mentions(self):
         """Busca menções recentes"""
         try:
-            query = f"@{self.bot_username} -is:retweet"
+            # Query mais simples e robusta
+            query = f"@{self.bot_username}"
             url = f"{self.base_url}/tweets/search/recent"
             params = {
                 'query': query,
                 'max_results': 10,
-                'tweet.fields': 'created_at,author_id,conversation_id'
+                'tweet.fields': 'created_at,author_id,conversation_id',
+                'expansions': 'author_id'
             }
             
             headers = {
@@ -266,10 +268,14 @@ class XAPIBot:
                 logging.info(f"Encontradas {len(tweets)} menções")
                 return tweets
             elif response.status_code == 429:
-                logging.warning("Rate limit - aguardando...")
+                logging.warning("Rate limit - aguardando 15 minutos...")
+                time.sleep(900)  # 15 minutos
+                return []
+            elif response.status_code == 400:
+                logging.error(f"Erro 400 - Query inválida. Response: {response.text}")
                 return []
             else:
-                logging.error(f"Erro search: {response.status_code}")
+                logging.error(f"Erro search: {response.status_code} - {response.text}")
                 return []
                 
         except Exception as e:
@@ -404,8 +410,10 @@ class XAPIBot:
                     'error': None
                 })
                 
-                # Aguardar próximo ciclo (5 minutos)
-                time.sleep(300)
+                # Aguardar próximo ciclo (10-15 minutos aleatório)
+                wait_time = random.randint(600, 900)  # 10-15 minutos
+                logging.info(f"Aguardando {wait_time//60} minutos antes do próximo ciclo")
+                time.sleep(wait_time)
                 
             except Exception as e:
                 logging.error(f"Erro no loop: {e}")
