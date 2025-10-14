@@ -28,8 +28,9 @@ BOT_USERNAME=drtrafeg0
 - **O BEARER_TOKEN tem caracteres especiais (%2F) - copie exato**
 
 ### 🧪 Teste após Deploy:
-- Acesse: `https://seu-app.railway.app/`
+- Acesse: `https://agente-twitter.up.railway.app/`
 - Deve retornar: `{"status":"healthy","bot_running":true}`
+- Status endpoint: `https://agente-twitter.up.railway.app/status`
 
 ### 📝 Variáveis Opcionais:
 ```
