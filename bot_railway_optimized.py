@@ -287,7 +287,7 @@ class XAPIBot:
             return []
 
     def create_tweet(self, text, reply_to=None):
-        """Cria um tweet"""
+        """Cria um tweet com controle de rate limiting"""
         try:
             url = f"{self.base_url}/tweets"
             
@@ -308,6 +308,11 @@ class XAPIBot:
                 self.last_activity = datetime.now()
                 logging.info(f"Tweet criado! Posts hoje: {self.daily_posts}/{self.daily_limit}")
                 return True
+            elif response.status_code == 429:
+                # Rate limit atingido - aguardar 15 minutos
+                logging.warning("Rate limit no tweet - aguardando 15 minutos...")
+                time.sleep(900)  # 15 minutos
+                return False
             else:
                 logging.error(f"Erro tweet: {response.status_code} - {response.text}")
                 return False
@@ -317,29 +322,39 @@ class XAPIBot:
             return False
 
     def process_mentions(self):
-        """Processa menções e responde"""
+        """Processa menções e responde - APENAS UMA POR CICLO"""
+        if self.daily_posts >= self.daily_limit:
+            logging.info("Limite diário atingido")
+            return
+            
         mentions = self.search_mentions()
+        if not mentions:
+            logging.info("Nenhuma menção encontrada")
+            return
+            
         responses = self.load_responses()
         
-        for mention in mentions:
-            if self.daily_posts >= self.daily_limit:
-                logging.info("Limite diário atingido")
-                break
-                
-            tweet_id = mention.get('id')
-            
-            # Escolher resposta aleatória
-            response_text = random.choice(responses)
-            
-            if self.create_tweet(response_text, reply_to=tweet_id):
-                logging.info(f"Respondeu à menção: {tweet_id}")
-                # Intervalo aleatório entre 2-4 minutos para evitar detecção
-                wait_time = random.randint(120, 240)
-                logging.info(f"Aguardando {wait_time//60}min {wait_time%60}s antes da próxima ação")
-                time.sleep(wait_time)
+        # PROCESSAR APENAS A PRIMEIRA MENÇÃO
+        mention = mentions[0]
+        tweet_id = mention.get('id')
+        
+        logging.info(f"Processando menção {tweet_id} (1 de {len(mentions)} encontradas)")
+        
+        # Delay inicial para evitar rate limit
+        initial_delay = random.randint(30, 60)  # 30-60 segundos
+        logging.info(f"Aguardando {initial_delay}s antes de responder...")
+        time.sleep(initial_delay)
+        
+        # Escolher resposta aleatória
+        response_text = random.choice(responses)
+        
+        if self.create_tweet(response_text, reply_to=tweet_id):
+            logging.info(f"Respondeu à menção: {tweet_id}")
+        else:
+            logging.warning(f"Falha ao responder menção: {tweet_id}")
 
     def process_post_comments(self):
-        """Processa comentários nos posts próprios"""
+        """Processa comentários nos posts próprios - APENAS UM POR CICLO"""
         global bot_status
         if self.daily_posts >= self.daily_limit:
             return
@@ -354,20 +369,34 @@ class XAPIBot:
         
         responses = self.load_responses()
         replies_found = 0
+        comment_processed = False
         
         for post in self.monitored_posts:
-            if self.daily_posts >= self.daily_limit:
+            if comment_processed:  # Sair após processar um comentário
                 break
                 
             post_id = post.get('id')
+            if not post_id:
+                continue
+                
             replies = self.search_replies_to_post(post_id)
             replies_found += len(replies)
             
             for reply in replies:
-                if self.daily_posts >= self.daily_limit:
+                if self.daily_posts >= self.daily_limit or comment_processed:
                     break
                     
                 reply_id = reply.get('id')
+                
+                if reply_id in self.replied_comments:
+                    continue  # Já respondeu este comentário
+                
+                logging.info(f"Processando comentário {reply_id} (encontrados {len(replies)} no post {post_id})")
+                
+                # Delay inicial para evitar rate limit
+                initial_delay = random.randint(30, 60)  # 30-60 segundos
+                logging.info(f"Aguardando {initial_delay}s antes de responder comentário...")
+                time.sleep(initial_delay)
                 
                 # Escolher resposta aleatória
                 response_text = random.choice(responses)
@@ -375,11 +404,10 @@ class XAPIBot:
                 if self.create_tweet(response_text, reply_to=reply_id):
                     logging.info(f"Respondeu ao comentário: {reply_id}")
                     self.replied_comments.add(reply_id)
-                    
-                    # Intervalo aleatório entre 2-4 minutos para evitar detecção
-                    wait_time = random.randint(120, 240)
-                    logging.info(f"Aguardando {wait_time//60}min {wait_time%60}s antes da próxima ação")
-                    time.sleep(wait_time)
+                    comment_processed = True  # Marcar que processou um comentário
+                else:
+                    logging.warning(f"Falha ao responder comentário: {reply_id}")
+                    comment_processed = True  # Mesmo com falha, não tentar mais neste ciclo
         
         bot_status['replies_found'] = replies_found
 
@@ -401,9 +429,15 @@ class XAPIBot:
                     # Processar menções (prioridade)
                     self.process_mentions()
                     
-                    # Processar comentários nos posts próprios
+                    # Delay entre processamentos para evitar rate limit
                     if self.daily_posts < self.daily_limit:
-                        self.process_post_comments()
+                        delay_between = random.randint(60, 120)  # 1-2 minutos
+                        logging.info(f"Aguardando {delay_between}s entre processamentos...")
+                        time.sleep(delay_between)
+                        
+                        # Processar comentários nos posts próprios
+                        if self.daily_posts < self.daily_limit:
+                            self.process_post_comments()
                 
                 # Atualizar status
                 global bot_status

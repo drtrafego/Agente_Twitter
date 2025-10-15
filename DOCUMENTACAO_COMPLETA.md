@@ -179,6 +179,41 @@ Após busca extensiva, confirmamos:
 - `diagnose_railway.py`: Diagnóstico completo do Railway
 - `monitor_bot.py`: Monitoramento contínuo (já existente)
 
+## 🚨 Correção de Rate Limiting (15/10/2025)
+
+### Problema Identificado
+- ❌ **Rate Limiting 429**: Múltiplas tentativas consecutivas de tweet
+- ❌ **8 tentativas em <1 segundo**: Causando bloqueio da API
+- ❌ **Aguardas de 10-15 minutos**: Entre ciclos devido aos erros
+
+### Correções Implementadas
+
+#### 1. **Tratamento Específico de 429**
+```python
+if response.status_code == 429:
+    logging.warning("Rate limit atingido - aguardando 15 minutos...")
+    time.sleep(900)  # 15 minutos
+    return False
+```
+
+#### 2. **Limitação de Processamento**
+- ✅ **1 menção por ciclo**: Evita múltiplas tentativas
+- ✅ **1 comentário por ciclo**: Controle de frequência
+- ✅ **Delay inicial 30-60s**: Antes de cada resposta
+- ✅ **Delay entre processamentos**: 1-2 minutos
+
+#### 3. **Controles Adicionais**
+- ✅ **Verificação de limite diário**: Antes de cada ação
+- ✅ **Logs detalhados**: Para monitoramento
+- ✅ **Saída controlada**: Após processar cada item
+
+### Comportamento Esperado
+1. **Ciclo de 10-15 minutos**: Entre execuções principais
+2. **Máximo 1 ação por ciclo**: Menção OU comentário
+3. **Delays apropriados**: 30-60s antes de responder
+4. **Limite diário**: Máximo 17 posts
+5. **Tratamento 429**: Aguarda 15min se necessário
+
 ## 🎯 Próximas Funcionalidades Planejadas
 
 ### Sistema de Postagens Agendadas (Em Estudo):
@@ -191,5 +226,5 @@ Após busca extensiva, confirmamos:
 ---
 
 **Status**: ✅ **TOTALMENTE FUNCIONAL**  
-**Última Atualização**: 14/10/2025  
+**Última Atualização**: 15/10/2025  
 **Desenvolvido por**: Trae AI Assistant
