@@ -86,6 +86,15 @@ class XAPIBot:
         self.comment_interval_sec = int(os.getenv('COMMENT_INTERVAL_SEC', '120'))
         # Controle de retry para menções em caso de 429 (não bloquear comentários)
         self.next_mentions_retry_at = datetime.now()
+        # Seed de posts monitorados via env (fallback para quota/cap)
+        seed_ids = os.getenv('MONITORED_POST_IDS', '').strip()
+        self.seeded_post_ids = False
+        if seed_ids:
+            ids = [i.strip() for i in seed_ids.split(',') if i.strip()]
+            if ids:
+                self.monitored_posts = [{'id': i} for i in ids]
+                self.seeded_post_ids = True
+                logging.info(f"Posts monitorados via env: {len(ids)} IDs fornecidos")
         logging.info(
             f"Config: MAX_COMMENTS_PER_CYCLE={self.max_comments_per_cycle}, COMMENT_INTERVAL_SEC={self.comment_interval_sec}s"
         )
@@ -159,11 +168,14 @@ class XAPIBot:
                 logging.info(f"Autenticado como @{username} (ID: {self.my_user_id})")
                 # Inicializar lista de posts monitorados imediatamente após autenticação
                 try:
-                    self.monitored_posts = self.get_my_recent_posts()
+                    if not self.seeded_post_ids:
+                        self.monitored_posts = self.get_my_recent_posts()
+                        logging.info(f"Posts monitorados inicializados via API: {len(self.monitored_posts)}")
+                    else:
+                        logging.info(f"Usando IDs de posts monitorados fornecidos por env (sem chamar API)")
                     self.last_comment_check = datetime.now()
                     global bot_status
                     bot_status['monitored_posts'] = len(self.monitored_posts)
-                    logging.info(f"Posts monitorados inicializados: {len(self.monitored_posts)}")
                 except Exception as init_err:
                     logging.warning(f"Não foi possível inicializar posts monitorados: {init_err}")
                 return True
@@ -385,11 +397,11 @@ class XAPIBot:
         if self.daily_posts >= self.daily_limit:
             return
         
-        # Atualizar lista de posts próprios a cada hora OU se lista estiver vazia (inicial)
-        if not self.monitored_posts or (datetime.now() - self.last_comment_check).seconds > 3600:
+        # Atualizar posts próprios: apenas se lista estiver vazia
+        # ou se passou 1h e NÃO estivermos usando seed via env (para evitar quota)
+        if (not self.monitored_posts) or ((datetime.now() - self.last_comment_check).seconds > 3600 and not self.seeded_post_ids):
             self.monitored_posts = self.get_my_recent_posts()
             self.last_comment_check = datetime.now()
-            
             global bot_status
             bot_status['monitored_posts'] = len(self.monitored_posts)
         
