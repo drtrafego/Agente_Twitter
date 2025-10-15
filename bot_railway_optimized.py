@@ -81,6 +81,14 @@ class XAPIBot:
         self.monitored_posts = []
         self.replied_comments = set()  # IDs dos comentários já respondidos
         self.last_comment_check = datetime.now()
+        # Configuração de processamento de comentários
+        self.max_comments_per_cycle = int(os.getenv('MAX_COMMENTS_PER_CYCLE', '2'))
+        self.comment_interval_sec = int(os.getenv('COMMENT_INTERVAL_SEC', '120'))
+        # Controle de retry para menções em caso de 429 (não bloquear comentários)
+        self.next_mentions_retry_at = datetime.now()
+        logging.info(
+            f"Config: MAX_COMMENTS_PER_CYCLE={self.max_comments_per_cycle}, COMMENT_INTERVAL_SEC={self.comment_interval_sec}s"
+        )
         
         logging.info(f"Bot inicializado para @{self.bot_username}")
 
@@ -149,6 +157,15 @@ class XAPIBot:
                 username = user_data.get('username', 'unknown')
                 self.my_user_id = user_data.get('id')
                 logging.info(f"Autenticado como @{username} (ID: {self.my_user_id})")
+                # Inicializar lista de posts monitorados imediatamente após autenticação
+                try:
+                    self.monitored_posts = self.get_my_recent_posts()
+                    self.last_comment_check = datetime.now()
+                    global bot_status
+                    bot_status['monitored_posts'] = len(self.monitored_posts)
+                    logging.info(f"Posts monitorados inicializados: {len(self.monitored_posts)}")
+                except Exception as init_err:
+                    logging.warning(f"Não foi possível inicializar posts monitorados: {init_err}")
                 return True
             else:
                 logging.error(f"Erro auth: {response.status_code} - {response.text}")
@@ -272,8 +289,11 @@ class XAPIBot:
                 logging.info(f"Encontradas {len(tweets)} menções")
                 return tweets
             elif response.status_code == 429:
-                logging.warning("Rate limit - aguardando 15 minutos...")
-                time.sleep(900)  # 15 minutos
+                # Não bloquear o loop; configurar retry para menções e seguir com comentários
+                self.next_mentions_retry_at = datetime.now() + timedelta(minutes=15)
+                logging.warning(
+                    f"Rate limit em menções. Pausando menções até {self.next_mentions_retry_at.isoformat()}"
+                )
                 return []
             elif response.status_code == 400:
                 logging.error(f"Erro 400 - Query inválida. Response: {response.text}")
@@ -326,6 +346,12 @@ class XAPIBot:
         if self.daily_posts >= self.daily_limit:
             logging.info("Limite diário atingido")
             return
+        # Respeitar janela de retry de menções (para não bloquear comentários)
+        if datetime.now() < self.next_mentions_retry_at:
+            logging.info(
+                f"Menções pausadas até {self.next_mentions_retry_at.isoformat()} devido a rate limit"
+            )
+            return
             
         mentions = self.search_mentions()
         if not mentions:
@@ -354,13 +380,13 @@ class XAPIBot:
             logging.warning(f"Falha ao responder menção: {tweet_id}")
 
     def process_post_comments(self):
-        """Processa comentários nos posts próprios - APENAS UM POR CICLO"""
+        """Processa comentários nos posts próprios com intervalo entre respostas"""
         global bot_status
         if self.daily_posts >= self.daily_limit:
             return
         
-        # Atualizar lista de posts próprios a cada hora
-        if (datetime.now() - self.last_comment_check).seconds > 3600:
+        # Atualizar lista de posts próprios a cada hora OU se lista estiver vazia (inicial)
+        if not self.monitored_posts or (datetime.now() - self.last_comment_check).seconds > 3600:
             self.monitored_posts = self.get_my_recent_posts()
             self.last_comment_check = datetime.now()
             
@@ -369,10 +395,10 @@ class XAPIBot:
         
         responses = self.load_responses()
         replies_found = 0
-        comment_processed = False
+        processed_count = 0
         
         for post in self.monitored_posts:
-            if comment_processed:  # Sair após processar um comentário
+            if self.daily_posts >= self.daily_limit or processed_count >= self.max_comments_per_cycle:
                 break
                 
             post_id = post.get('id')
@@ -383,7 +409,7 @@ class XAPIBot:
             replies_found += len(replies)
             
             for reply in replies:
-                if self.daily_posts >= self.daily_limit or comment_processed:
+                if self.daily_posts >= self.daily_limit or processed_count >= self.max_comments_per_cycle:
                     break
                     
                 reply_id = reply.get('id')
@@ -393,10 +419,15 @@ class XAPIBot:
                 
                 logging.info(f"Processando comentário {reply_id} (encontrados {len(replies)} no post {post_id})")
                 
-                # Delay inicial para evitar rate limit
-                initial_delay = random.randint(30, 60)  # 30-60 segundos
-                logging.info(f"Aguardando {initial_delay}s antes de responder comentário...")
-                time.sleep(initial_delay)
+                # Intervalo entre respostas de comentários
+                if processed_count == 0:
+                    # Delay inicial para evitar rate limit
+                    initial_delay = random.randint(30, 60)  # 30-60 segundos
+                    logging.info(f"Aguardando {initial_delay}s antes de responder comentário...")
+                    time.sleep(initial_delay)
+                else:
+                    logging.info(f"Aguardando {self.comment_interval_sec}s antes da próxima resposta de comentário...")
+                    time.sleep(self.comment_interval_sec)
                 
                 # Escolher resposta aleatória
                 response_text = random.choice(responses)
@@ -404,10 +435,9 @@ class XAPIBot:
                 if self.create_tweet(response_text, reply_to=reply_id):
                     logging.info(f"Respondeu ao comentário: {reply_id}")
                     self.replied_comments.add(reply_id)
-                    comment_processed = True  # Marcar que processou um comentário
                 else:
                     logging.warning(f"Falha ao responder comentário: {reply_id}")
-                    comment_processed = True  # Mesmo com falha, não tentar mais neste ciclo
+                processed_count += 1
         
         bot_status['replies_found'] = replies_found
 
